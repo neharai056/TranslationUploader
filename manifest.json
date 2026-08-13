@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "SF Translation Workbench",
+  "version": "1.0.0",
+  "description": "View and update Custom Label and Validation Rule translations across all enabled org languages, on one screen.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Open Translation Workbench"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": [
+    "cookies",
+    "tabs",
+    "activeTab",
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://*.salesforce.com/*",
+    "https://*.force.com/*",
+    "https://*.my.salesforce.com/*",
+    "https://*.visualforce.com/*",
+    "https://*.lightning.force.com/*",
+    "https://*.cloudforce.com/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
