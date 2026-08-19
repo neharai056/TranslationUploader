@@ -30,7 +30,8 @@
     "https://*.my.salesforce.com/*",
     "https://*.visualforce.com/*",
     "https://*.lightning.force.com/*",
-    "https://*.cloudforce.com/*"
+    "https://*.cloudforce.com/*",
+    "https://*.salesforce-setup.com"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
