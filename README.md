@@ -1,165 +1,167 @@
-# SF Translation Workbench (Chrome Extension)
+SF Translation Workbench (Chrome Extension)
 
-Side-panel tool that shows **every enabled Translation Workbench
-language on one screen**, for both Custom Labels and Validation Rule
-error messages — no per-language switching, no Apex, no OAuth app to
-configure.
+**Reviewed:** `TranslationUploader-main.zip`
+**Scope:** `manifest.json`, `background.js`, `sidepanel.html/css/js`, `lib/sfSession.js`, `lib/toolingApi.js`, `lib/metadataApi.js`
 
-## 1. What the screen looks like
+## 1. What it does
 
-Each tab is a matrix: one row per Custom Label (or per Validation Rule),
-one column per enabled language. Cells that already have a translation
-are pre-filled; cells with no translation yet are blank and directly
-editable. Edit any cell inline, and only the cells you actually touched
-get saved — untouched cells, and untouched languages, are left alone.
+A Manifest V3 side-panel extension for Salesforce admins. It shows every enabled
+Translation Workbench language as a column, for two record types, on one screen:
 
-```
-+---------------------------------------------------------------------+
-| Label Name   | Category | Master Value | fr        | de       | ja |
-|--------------|----------|--------------|-----------|----------|----|
-| Greeting     | General  | Hello        | [Bonjour] | [      ] |... |
-| Farewell     | General  | Goodbye      | [       ] | [Auf...] |... |
-+---------------------------------------------------------------------+
-```
+- **Custom Labels** (`ExternalString` / `ExternalStringLocalization`, via Tooling API REST)
+- **Validation Rule error messages** (via Metadata API SOAP `retrieve`/`deploy`, since there's
+  no Tooling sObject for these)
 
-The first few columns (name/category/master value) stay pinned while
-you scroll horizontally through language columns.
+Auth comes from reading the active tab's Salesforce `sid` session cookie — no OAuth
+connected app required. All requests go to the user's own org (`*.my.salesforce.com`
+derived from the active tab); nothing is sent to a third-party server.
 
 ## 2. Architecture
 
 ```
-+-------------------------------------------------------------------+
-| Side Panel - single screen, 2 tabs, every enabled language as a   |
-| column in one matrix table                                        |
-|  Tab 1: Custom Labels           Tab 2: Validation Rules            |
-+---------------+-----------------------------------+---------------+
-                |                                     |
-        ToolingApi.js                          MetadataApi.js
-     (Tooling API REST,                      (Metadata API SOAP:
-      fetch + Bearer token)                   retrieve/deploy/listMetadata,
-                |                              via JSZip for zip payloads)
-                |                                     |
-        ExternalString /                      Translations metadata
-        ExternalStringLocalization             (<lang>.translation,
-                                                 validationRules node)
+sidepanel.js  ──uses──►  SfSession (cookie → session)
+              ──uses──►  ToolingApi (REST: Custom Labels)
+              ──uses──►  MetadataApi (SOAP: Validation Rule translations, via JSZip)
+background.js ──opens the side panel on toolbar-icon click
 ```
 
-Session comes from `chrome.cookies.get()` reading the active tab's `sid`
-cookie (see `lib/sfSession.js`) — no OAuth app, no connected app setup,
-no client id/secret to manage. This only works while you have the target
-org open and logged in in the active browser tab. The org id used for
-Metadata API SOAP calls is parsed straight out of the session id
-(`sid.split('!')[0]`), so no separate login/lookup call is needed.
+Clean separation of concerns: session resolution, REST client, and SOAP client are
+each self-contained IIFEs exposed as globals, consumed by the UI layer. No framework,
+no build step — plain script tags. Reasonable choice for an internal admin tool.
 
-### Why two APIs
+## 3. Strengths
 
-- **Custom Labels** are real Tooling API sObjects (`ExternalString` /
-  `ExternalStringLocalization`) — plain REST, synchronous, no deploy.
-  `ToolingApi.getCustomLabelsMatrix()` fetches all labels and all
-  languages' localizations in two queries total (not one query per
-  language) and assembles the matrix client-side.
+- **No remote code / no CDN scripts.** CSP is `script-src 'self'; object-src 'self'`,
+  and JSZip is meant to be vendored locally rather than pulled from unpkg/CDN — correct
+  call for MV3, since remote-hosted code is disallowed anyway.
+- **HTML injection is handled.** All Salesforce-sourced text rendered into the DOM
+  (label names, master values, translated values) goes through `escapeHtml()` before
+  being interpolated into template strings. This is the main XSS risk in an app that
+  builds HTML via string concatenation, and it's covered on every text field I checked.
+- **Scoped API surface.** `host_permissions` lists only Salesforce/Force.com domain
+  families; `fetch` calls are built from `session.apiHost`, which is derived from the
+  *active tab's own URL*, not user input — so there's no way to point the extension's
+  authenticated requests at an arbitrary host.
+- **Sensible SOAP/merge logic.** `mergeValidationRuleTranslations()` re-parses the
+  existing `<Translations>` file and only touches the `<validationRules>` nodes being
+  edited, leaving `customLabels`/`reports`/etc. in that file untouched — avoids
+  clobbering unrelated translations on deploy.
+- **Race-window mitigation, honestly documented.** Validation Rule saves re-`retrieve()`
+  the file immediately before merging/deploying to shrink the window against a
+  concurrent editor, and the README is upfront that this reduces rather than eliminates
+  the race (Metadata API has no optimistic locking). Good that this limitation is
+  surfaced rather than glossed over.
+- **Dirty-cell tracking is correct.** Save compares `input.value` against
+  `input.defaultValue` (the value at render time), so only touched cells are sent —
+  matches the stated "only edited cells are saved" behavior.
 
-- **Validation rule error-message translations** only exist inside the
-  `Translations` metadata bundle — there's no Tooling sObject for them.
-  `MetadataApi.getValidationRuleTranslationsForLanguages()` retrieves
-  one `<lang>.translation` file per enabled language (sequential SOAP
-  `retrieve()`/poll round-trips — this is the slower part of a page
-  load with several languages enabled) and parses out the
-  `<validationRules>` nodes for display.
+## 4. Bugs
 
-Because this runs in plain JS (not Apex), the SOAP envelopes for
-`listMetadata` / `retrieve` / `checkRetrieveStatus` / `deploy` /
-`checkDeployStatus` are just built as template strings and parsed with
-`DOMParser` — no WSDL2Apex code-generation step is needed here (that
-was an Apex-specific requirement in the LWC/Apex version of this tool).
+### 4.1 Missing dependency — breaks Validation Rules tab (blocking)
+`sidepanel.html` loads `lib/jszip.min.js`, but that file is **not included** in the
+zip. `metadataApi.js` calls `JSZip.loadAsync(...)` / `new JSZip()` unconditionally in
+`retrieveTranslationXml` and `deployTranslationXml`. Without the file, any attempt to
+open the Validation Rules tab throws `JSZip is not defined` and the tab never loads.
 
-## 3. Save behavior (grouped by language)
+The README explains this is intentional — the author didn't want to hand-paste
+minified third-party code into the repo — but it means **the extension is non-functional
+out of the box** until someone manually adds `lib/jszip.min.js` (e.g. `npm i jszip`,
+copy `dist/jszip.min.js`). This must be done before packaging for distribution, whether
+that's Chrome Web Store or internal unpacked install.
 
-- **Custom Labels**: dirty cells are tracked per `(label, language)`
-  pair. On Save, `ToolingApi.saveCustomLabelMatrixUpdates()` groups them
-  by language and issues one Tooling API create/update per changed cell
-  — synchronous, no deploy queue involved.
-
-- **Validation Rules**: dirty cells are tracked the same way, but since
-  each language lives in one deployable file, Save groups changes by
-  language and, **for each affected language only**: re-`retrieve()`s
-  the current file (to shrink the race window with a concurrent edit
-  from someone else), merges in just the changed `<validationRules>`
-  entries (every other node in that file — customLabels, reports,
-  whatever else is already translated — is left untouched), then
-  `deploy()`s it. Languages are processed **sequentially**, not in
-  parallel, to avoid metadata deploy lock contention on the same org;
-  the status line shows which language/phase is in flight
-  (`Retrieving fr (1/3)…`, `Deploying fr (1/3)…`).
-
-## 4. Required third-party dependency: JSZip
-
-Manifest V3's content security policy blocks remotely-loaded scripts, so
-JSZip must be vendored locally rather than pulled from a CDN `<script>`
-tag. Grab the official build and drop it in:
-
+### 4.2 `saveCustomLabels` — dead/confusing call-signature branching (minor)
+```js
+async function saveCustomLabels(session, languageOrUpdates, updatesArray) {
+  let language = '';
+  let updates = [];
+  if (Array.isArray(languageOrUpdates)) {
+    updates = languageOrUpdates;
+  } else {
+    language = languageOrUpdates;
+    updates = updatesArray || [];
+  }
+  ...
 ```
-lib/jszip.min.js
+Only the array-first call pattern (`saveCustomLabels(session, rowsToSave)`) is ever
+used from `sidepanel.js`. The `(session, language, updates)` branch is unreachable
+dead code that adds complexity without payoff — worth deleting unless there's a
+planned second caller.
+
+### 4.3 Validation Rule save has no confirmation of partial failure across languages (minor)
+`saveData()`'s validation-rule branch loops languages sequentially and calls
+`MetadataApi.saveValidationRules` per language. If language 2 of 3 fails, the `catch`
+reports the error, but language 1's deploy already succeeded and language 3 is never
+attempted — the status message doesn't distinguish "nothing saved" from "partially
+saved." Not a security issue, but worth a status-line tweak (e.g. "Saved fr; failed on
+de, stopped before ja") so admins aren't surprised on retry.
+
+### 4.4 `EntityDefinitionId` chunking guards against `IN ()` but not against SOQL injection risk pattern (informational, not currently exploitable)
+`getValidationRuleMasters` builds a `WHERE DurableId IN ('id1','id2')` clause via
+string concatenation with a manual `'` → `\'` escape:
+```js
+const quoted = chunk.map((id) => `'${id.replace(/'/g, "\\'")}'`).join(',');
 ```
+`durableIds` here only ever contains values Salesforce itself returned from a prior
+query (`EntityDefinitionId` off `ValidationRule` records), not user input, so this
+isn't reachable as an injection vector today. Flagging only because if this pattern is
+copied elsewhere for a field that *does* accept free text, the escaping is incomplete
+(SOQL bind-safe escaping needs more than single-quote handling). Prefer Tooling API's
+`?q=` with values sourced strictly from prior query results, as is already the case
+here, and avoid reusing this string-building style for anything user-editable.
 
-JSZip doesn't publish GitHub Releases — get it one of these ways:
-- `npm i jszip` (currently 3.10.1), then copy
-  `node_modules/jszip/dist/jszip.min.js`
-- `https://github.com/Stuk/jszip/blob/v3.10.1/dist/jszip.min.js` -> click
-  **Raw** -> Save As (the rendered GitHub page itself is not the file)
-- `https://unpkg.com/jszip@3.10.1/dist/jszip.min.js` -> Save As
+### 4.5 Empty-value save/create asymmetry (minor, likely intentional but worth confirming)
+In `saveCustomLabels`, editing an *existing* localization to empty string sends an
+`UPDATE` with `Value: ''` (translation effectively cleared but record kept). Clearing
+a cell that never had a translation (`localizationId` empty) is silently skipped — no
+record created, which is correct (avoids creating empty localization rows) but means
+"delete this translation" and "never had one" end up looking identical in the UI after
+a refresh. Fine as designed, just worth a one-line README note so it's not mistaken for
+a bug later.
 
-Pin a specific version for reproducible builds. This project was built
-against the 3.x API (`JSZip.loadAsync`, `zip.generateAsync`,
-`zip.file()`), stable across the 3.x line.
+## 5. Security review
 
-JSZip's minified source isn't pasted into this deliverable — it's a
-large, third-party-maintained file, and hand-transcribing minified code
-from memory risks silently shipping a broken/corrupted build. Same
-reasoning as depending on `MetadataService.cls`/`Zippex.cls` in the
-Apex/LWC version of this tool: vendor the real, official artifact
-rather than a reconstruction.
+- **Session handling:** reads the `sid` HttpOnly cookie via `chrome.cookies.get()`,
+  scoped to the derived API host of the *active* Salesforce tab only. The session
+  value is held in memory (`state.session`) for the life of the side panel, never
+  written to `chrome.storage` or logged. Good — an extension holding a live Salesforce
+  session token is inherently sensitive, and this doesn't persist it anywhere.
+- **No data leaves Salesforce + the browser.** Every `fetch`/SOAP call targets
+  `session.apiHost`, which is always a Salesforce-family domain matching
+  `host_permissions`. There's no analytics, telemetry, or third-party endpoint anywhere
+  in the code.
+- **CSP is locked down** (`script-src 'self'; object-src 'self'`) and there's no
+  `eval`, `new Function`, or remote script injection anywhere.
+- **XSS surface is covered** — see §3, `escapeHtml()` is applied consistently to
+  Salesforce-sourced strings rendered as text/attribute values. IDs interpolated
+  unescaped (`data-external-id`, `data-localization-id`) are Salesforce record IDs
+  (fixed 15/18-char alphanumeric format), not free text, so this isn't exploitable.
+- **Permissions are broader than strictly necessary in one spot:** manifest requests
+  both `tabs` and `activeTab`. The only tab API usage is
+  `chrome.tabs.query({active: true, currentWindow: true})` inside a session-init flow
+  triggered by the user opening the side panel — this is exactly the kind of access
+  `activeTab` alone is designed to grant. `tabs` is a broader, persistent permission
+  (visibility into all tabs' URLs, not just the active one at invocation time) that
+  isn't used anywhere in the code. Worth testing with `tabs` removed; dropping it
+  reduces the permission footprint and the odds of extra scrutiny in store review.
 
-## 5. Install (unpacked, for internal/admin use)
+## 6. Fix-before-shipping checklist
 
-1. Add `lib/jszip.min.js` as described above.
-2. Go to `chrome://extensions`, enable **Developer mode** (top right).
-3. Click **Load unpacked**, select the `sf-translation-ext` folder.
-4. Pin the extension, open your Salesforce org in a tab, click the
-   extension icon — the side panel opens, detects the org, lists its
-   enabled languages, and loads both matrices.
+| # | Item | Severity |
+|---|------|----------|
+| 1 | Add real `lib/jszip.min.js` (vendor per README instructions) — extension is broken without it | **Blocking** |
+| 2 | Confirm `tabs` permission can be dropped (only `activeTab` usage observed) | Should-fix |
+| 3 | Remove dead 3-arg branch in `ToolingApi.saveCustomLabels` | Nice-to-have |
+| 4 | Improve status messaging for partial multi-language save failures | Nice-to-have |
+| 5 | Note the "clear vs. never-translated" empty-cell behavior in README/UI copy | Nice-to-have |
 
-## 6. Known limitations / things to verify before rolling out broadly
+## 7. Bottom line
 
-- **Page-load cost scales with language count**: Custom Labels load in
-  two queries regardless of language count, but Validation Rules do one
-  sequential Metadata API retrieve per language — an org with many
-  enabled languages will take proportionally longer to populate that
-  tab. The status line reports progress per language rather than
-  leaving a blank spinner.
-- **Custom domains**: `host_permissions` covers `*.salesforce.com`,
-  `*.force.com`, `*.my.salesforce.com`, `*.lightning.force.com`,
-  `*.visualforce.com`, `*.cloudforce.com` (sandboxes). An org on a fully
-  vanity Enhanced Domain that doesn't resolve through one of those
-  suffixes will need an extra host permission entry added to
-  `manifest.json`.
-- **`sid` cookie visibility**: if the org enforces a session security
-  policy that scopes the session cookie more restrictively, or the user
-  has cookie-blocking extensions that also intercept `chrome.cookies`,
-  session detection can fail — the panel surfaces this as an explicit
-  error rather than failing silently.
-- **Concurrent edits**: Validation Rule saves re-retrieve each affected
-  language's file immediately before merging/deploying, to shrink —
-  not eliminate — the race window with another admin editing the same
-  file. Metadata API deploy has no optimistic-locking primitive; last
-  deploy wins, same as Setup UI behavior. If two admins are editing
-  different languages at once, there's no conflict, since each language
-  is an independent file.
-- **Deploy latency**: Validation Rule saves are asynchronous
-  (retrieve+deploy per affected language); the UI shows status text
-  through each phase rather than a fixed spinner, and multiple changed
-  languages are deployed one at a time, not in parallel.
-- This extension calls the API **with the permissions of whoever is
-  logged into the active tab** — it inherits their access, it does not
-  elevate it. Treat distributing this extension the same as distributing
-  any tool with Setup access: restrict to trusted admins.
+The code is competent, single-purpose, and doesn't do anything a Chrome reviewer
+would flag as malicious — no remote code, no data exfiltration, consistent output
+escaping, tightly scoped host permissions. The one functional blocker is the missing
+`jszip.min.js` file; everything else is polish. The `cookies` permission and session-
+token handling are the right design for this problem (no OAuth app to provision), but
+expect Chrome Web Store's manual review to ask for justification given how sensitive
+that permission is — worth having a one-paragraph explanation ready (reads the active
+Salesforce tab's own session cookie solely to authenticate Tooling/Metadata API calls
+to that same org; never transmitted or stored elsewhere).
